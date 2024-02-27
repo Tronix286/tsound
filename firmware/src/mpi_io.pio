@@ -1,0 +1,199 @@
+.define public AD0_PIN 0
+.define public IOW_PIN 19
+.define public IOR_PIN 18
+.define public RPLY_PIN 26
+.define public DIR_PIN 27
+.define public SYNC_PIN 17
+.define public BYTE_PIN 16
+
+.program addr_mux
+.wrap_target
+restart:
+    wait 1 gpio IOR_PIN
+    wait 1 gpio IOW_PIN
+    wait 1 gpio SYNC_PIN
+    wait 0 gpio SYNC_PIN
+    mov x,!pins
+    in x,16
+.wrap
+
+% c-sdk {
+static inline void addr_mux_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = addr_mux_program_get_default_config(offset);
+
+    // Set up AD0 pins as input
+    sm_config_set_in_pins(&c, AD0_PIN);
+    // Autopush at 16 bits (16 addr)
+    sm_config_set_in_shift(&c, false, true, 16);
+
+    // set up SYNC_PIN , IOR_PIN, IOW_PIN
+    pio_sm_set_consecutive_pindirs(pio, sm, SYNC_PIN, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, IOR_PIN, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, IOW_PIN, 1, false);
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_set_irq0_source_enabled(pio, pis_sm0_rx_fifo_not_empty, true);
+
+    // Set the state machine running
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+.program iow
+.side_set 1 opt                   ; sideset bit 0 is DIR_PIN
+restart:
+.wrap_target
+    wait 1 gpio IOR_PIN           ; just for sure
+    wait 0 gpio IOW_PIN           ; IOW falling edge, no sideset to not conflict with other SMs
+    in pins, 17  [3]    side 0b1  ; Read data - 16 data bits + 1 BYTE_PIN determine byte/word cycle
+    out X, 32           side 0b1  ; stall here - get condition from handle_iow
+    jmp !X restart      side 0b1  ; if we get a 0 condition from handle_iow, it's not an interesting address
+    irq set 5                     ; start RPLY state machine (ack to bus address accepted)
+    wait 1 gpio IOW_PIN side 0b1  ; wait cycle end
+.wrap
+
+% c-sdk {
+static inline void iow_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = iow_program_get_default_config(offset);
+
+    // Set up AD0 pins as input
+    sm_config_set_in_pins(&c, AD0_PIN);
+    // Autopush at 17 bits (16 data + 1 BYTE_PIN)
+    sm_config_set_in_shift(&c, false, true, 17);
+
+    // Autopull 32 bits (condition variables from handle_iow)
+    sm_config_set_out_shift(&c, true, true /* autopull */, 32);
+
+    // Set the pin direction for IOW and AD0 bus as input at the PIO
+    pio_sm_set_consecutive_pindirs(pio, sm, IOR_PIN, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, IOW_PIN, 1, false);
+    pio_sm_set_consecutive_pindirs(pio, sm, AD0_PIN, 16, false);
+
+    // set up DIR_PIN
+    sm_config_set_sideset_pins(&c, DIR_PIN);
+    pio_gpio_init(pio, DIR_PIN);
+    pio_sm_set_consecutive_pindirs(pio, sm, DIR_PIN, 1, true);
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << DIR_PIN);
+
+    // JMP on DACK so we can ignore iow during DMA write
+    //sm_config_set_jmp_pin(&c, BYTE_PIN);
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_set_irq1_source_enabled(pio, pis_sm0_rx_fifo_not_empty, true);
+
+    // Set the state machine running
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+.program ior
+.side_set 1 opt                  ; sideset  bit 0 is DIR_PIN
+restart:
+    wait 1 gpio IOR_PIN          ; ensure IOR high when PIO starts
+.wrap_target
+    wait 1 gpio IOW_PIN          ; for make sure
+    wait 0 gpio IOR_PIN          ; IOR falling edge, no sideset to not conflict with other SMs
+    in x, 16            side 0b1 ; - force handle_ior - send random data
+    out X, 16           side 0b1 ; stall until we get condition from handle_ior
+    jmp !X restart      side 0b1 ; if we get a 0 condition from handle_ior, it's not an interesting address
+    irq set 6                    ; start RPLY2 state machine
+    out pins, 16         side 0b1 ; output data to be written
+    mov osr, ~null      side 0b1 ; osr = 0xffffffff
+    out pindirs, 16     side 0b0 ; 16 in pindirs is FF - set pindirs as output
+    wait 1 gpio IOR_PIN side 0b0 ; - wait for IOR rising edge with IOCHRDY high
+    mov osr, null        side 0b1 ; osr = 0x0
+    out pindirs, 16      side 0b1 ; 16 in pindirs is 00 - set pindirs back as input
+.wrap
+
+% c-sdk {
+static inline void ior_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = ior_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&c, AD0_PIN);
+    sm_config_set_in_shift(&c, false, true, 16);
+
+    // set up SYNC_PIN
+    pio_gpio_init(pio, SYNC_PIN);
+    pio_gpio_init(pio, IOR_PIN);
+    pio_gpio_init(pio, IOW_PIN);
+    // Set the pin direction to input at the PIO
+    pio_sm_set_consecutive_pindirs(pio, sm, AD0_PIN, 16, false);
+
+    sm_config_set_out_pins(&c, AD0_PIN, 16);
+    sm_config_set_out_shift(&c, true, true /* autopull */, 16);
+    // Set this pin's GPIO function (connect PIO to the pad)
+    for (int i = AD0_PIN; i <= AD0_PIN + 16; i++) {
+        pio_gpio_init(pio, i);
+    }
+
+    // set up DIR_PIN
+    sm_config_set_sideset_pins(&c, DIR_PIN);
+    pio_gpio_init(pio, DIR_PIN);
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << DIR_PIN);
+    pio_sm_set_consecutive_pindirs(pio, sm, DIR_PIN, 1, true);
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_set_irq0_source_enabled(pio, pis_sm1_rx_fifo_not_empty, true);
+
+    // Set the state machine running
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+.program rply
+.side_set 1 opt
+.wrap_target
+    wait 1 irq 5
+    nop [5] side 0b1
+    nop [5] side 0b0
+.wrap
+
+% c-sdk {
+static inline void rply_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = rply_program_get_default_config(offset);
+
+    sm_config_set_clkdiv(&c, 20.0f);
+
+    sm_config_set_sideset_pins(&c, RPLY_PIN);
+    pio_gpio_init(pio, RPLY_PIN);
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << RPLY_PIN);
+    pio_sm_set_consecutive_pindirs(pio, sm, RPLY_PIN, 1, true);
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+    // Set the state machine running
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+
+.program rply2
+.side_set 1 opt
+.wrap_target
+    wait 1 irq 6
+    nop [5] side 0b1
+    nop [5] side 0b0
+.wrap
+
+% c-sdk {
+static inline void rply2_program_init(PIO pio, uint sm, uint offset) {
+    pio_sm_config c = rply2_program_get_default_config(offset);
+
+    sm_config_set_clkdiv(&c, 20.0f);
+
+    sm_config_set_sideset_pins(&c, RPLY_PIN);
+    pio_gpio_init(pio, RPLY_PIN);
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << RPLY_PIN);
+    pio_sm_set_consecutive_pindirs(pio, sm, RPLY_PIN, 1, true);
+
+    // Load our configuration, and jump to the start of the program
+    pio_sm_init(pio, sm, offset, &c);
+    // Set the state machine running
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
